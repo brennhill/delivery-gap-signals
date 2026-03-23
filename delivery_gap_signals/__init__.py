@@ -29,4 +29,6 @@ __all__ = [
     "is_source_file",
 ]
 
-__version__ = "0.1.0"
+from .models import CIStatus, MergedChange, Review
+
+__version__ = "0.2.0"
