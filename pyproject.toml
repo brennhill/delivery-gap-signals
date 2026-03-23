@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "delivery-gap-signals"
+version = "0.1.0"
+description = "Shared signal detection for delivery pipeline tools"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [
+    { name = "Brenn Hill", email = "brennhill@gmail.com" },
+]
+keywords = [
+    "devops", "signals", "rework-detection", "delivery-gap",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+]
+
+[tool.setuptools.packages.find]
+include = ["delivery_gap_signals*"]
