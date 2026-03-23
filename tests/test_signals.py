@@ -53,9 +53,10 @@ class TestIsFixMessage(unittest.TestCase):
     def test_not_fix(self):
         self.assertFalse(is_fix_message("feat: add checkout"))
 
-    def test_revert_not_fix(self):
-        """revert is detected by is_revert_message, not is_fix_message."""
-        self.assertFalse(is_fix_message("Revert \"add feature\""))
+    def test_revert_is_also_fix(self):
+        """revert matches both is_fix_message and is_revert_message — it's follow-up work."""
+        self.assertTrue(is_fix_message("revert: undo broken change"))
+        self.assertTrue(is_fix_message("Revert \"add feature\""))
 
 
 class TestIsRevertMessage(unittest.TestCase):

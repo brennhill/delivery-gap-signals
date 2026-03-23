@@ -23,7 +23,7 @@ TICKET_PATTERNS = [
 # ── Fix detection ────────────────────────────────────────────────────
 
 FIX_PATTERNS = re.compile(
-    r"^(fix|hotfix|bugfix|patch)[\s(:!/]",
+    r"^(fix|hotfix|bugfix|patch|revert)[\s(:!/]",
     re.IGNORECASE | re.MULTILINE,
 )
 
