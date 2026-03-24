@@ -6,15 +6,32 @@ Each adapter exports a fetch_changes() function returning list[MergedChange].
 from pathlib import Path
 
 
-def auto_fetch(repo: str, lookback_days: int = 90, *, limit: int = 500):
-    """Detect the right adapter based on repo format.
+def auto_fetch(
+    repo: str,
+    lookback_days: int = 90,
+    *,
+    limit: int = 500,
+    source: str | None = None,
+):
+    """Detect the right adapter based on repo format or explicit source.
 
-    - "owner/repo" → GitHub
-    - Local directory → git
-    - File path → cached JSON
+    source options: "github" (default for owner/repo), "graphql", "git", "file"
     """
-    from ..models import MergedChange
+    # Explicit source override
+    if source == "graphql":
+        from . import github_graphql
+        return github_graphql.fetch_changes(repo, lookback_days, limit=limit)
+    elif source == "rest" or source == "github":
+        from . import github
+        return github.fetch_changes(repo, lookback_days, limit=limit)
+    elif source == "git":
+        from . import git
+        return git.fetch_changes(repo, lookback_days, limit=limit)
+    elif source == "file":
+        from . import file
+        return file.fetch_changes(repo)
 
+    # Auto-detect
     if Path(repo).is_file():
         from . import file
         return file.fetch_changes(repo)
