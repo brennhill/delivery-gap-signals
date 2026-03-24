@@ -186,5 +186,98 @@ class TestFetchChanges(unittest.TestCase):
         self.assertEqual(changes[0].deletions, 25)
 
 
+class TestAdaptivePageSize(unittest.TestCase):
+
+    @mock.patch.object(github_graphql, "_run_graphql")
+    def test_halves_page_size_on_gateway_error(self, mock_gql):
+        """502 should halve page size and retry same cursor."""
+        pr = _make_pr_node(number=1)
+        mock_gql.side_effect = [
+            RuntimeError("GraphQL query failed: 502 Bad Gateway"),
+            _graphql_response([pr]),
+        ]
+
+        changes = github_graphql.fetch_changes("owner/repo", page_size=100)
+
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(mock_gql.call_count, 2)
+        # Second call should have smaller pageSize
+        second_call_vars = mock_gql.call_args_list[1][0][1]
+        self.assertEqual(second_call_vars["pageSize"], 50)
+
+    @mock.patch.object(github_graphql, "_run_graphql")
+    def test_halves_repeatedly_until_success(self, mock_gql):
+        """Multiple 502s should keep halving: 100 → 50 → 25 → success."""
+        pr = _make_pr_node(number=1)
+        mock_gql.side_effect = [
+            RuntimeError("502"),
+            RuntimeError("504"),
+            _graphql_response([pr]),
+        ]
+
+        changes = github_graphql.fetch_changes("owner/repo", page_size=100)
+
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(mock_gql.call_count, 3)
+        third_call_vars = mock_gql.call_args_list[2][0][1]
+        self.assertEqual(third_call_vars["pageSize"], 25)
+
+    @mock.patch.object(github_graphql, "_run_graphql")
+    def test_gives_up_at_min_page_size(self, mock_gql):
+        """Should raise if still failing at MIN_PAGE_SIZE."""
+        mock_gql.side_effect = RuntimeError("502")
+
+        with self.assertRaises(RuntimeError):
+            github_graphql.fetch_changes("owner/repo", page_size=5)
+
+    @mock.patch.object(github_graphql, "_run_graphql")
+    def test_grows_back_after_success(self, mock_gql):
+        """After a successful small page, should try growing back."""
+        page1_pr = _make_pr_node(number=1)
+        page2_pr = _make_pr_node(number=2)
+        mock_gql.side_effect = [
+            RuntimeError("502"),                                    # 100 fails
+            _graphql_response([page1_pr], has_next=True, end_cursor="c1"),  # 50 works
+            _graphql_response([page2_pr]),                          # grows back to 100
+        ]
+
+        changes = github_graphql.fetch_changes("owner/repo", page_size=100)
+
+        self.assertEqual(len(changes), 2)
+        # First retry at 50, then grows back to 100
+        third_call_vars = mock_gql.call_args_list[2][0][1]
+        self.assertEqual(third_call_vars["pageSize"], 100)
+
+    @mock.patch.object(github_graphql, "_run_graphql")
+    def test_non_gateway_error_raises_immediately(self, mock_gql):
+        """Auth errors should not trigger backoff."""
+        mock_gql.side_effect = RuntimeError("401 Unauthorized")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            github_graphql.fetch_changes("owner/repo")
+
+        self.assertIn("401", str(ctx.exception))
+        self.assertEqual(mock_gql.call_count, 1)  # no retry
+
+    @mock.patch.object(github_graphql, "_run_graphql")
+    def test_pages_until_lookback_covered(self, mock_gql):
+        """Should keep paging until all PRs in the window are fetched."""
+        pages = []
+        for i in range(5):
+            pr = _make_pr_node(number=i + 1, merged_days_ago=10 + i * 15)
+            has_next = i < 4
+            pages.append(_graphql_response([pr], has_next=has_next,
+                                           end_cursor=f"c{i}" if has_next else None))
+        mock_gql.side_effect = pages
+
+        changes = github_graphql.fetch_changes("owner/repo", lookback_days=90)
+
+        # All 5 pages fetched, but only PRs within 90 days kept
+        self.assertEqual(mock_gql.call_count, 5)
+        for c in changes:
+            age = (datetime.now(timezone.utc) - c.merged_at).days
+            self.assertLessEqual(age, 90)
+
+
 if __name__ == "__main__":
     unittest.main()

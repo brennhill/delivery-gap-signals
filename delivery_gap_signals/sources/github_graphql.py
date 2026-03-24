@@ -24,13 +24,16 @@ _BOT_REVIEWERS = {
 
 # GraphQL query — fetches merged PRs with reviews, commits, files, and CI status.
 # Uses cursor-based pagination via $after.
+_MIN_PAGE_SIZE = 5
+_GATEWAY_SIGNALS = ("502", "504", "stream error", "CANCEL", "timed out")
+
 _QUERY = """
-query($owner: String!, $repo: String!, $after: String, $since: DateTime!) {
+query($owner: String!, $repo: String!, $after: String, $since: DateTime!, $pageSize: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequests(
       states: MERGED,
       orderBy: {field: UPDATED_AT, direction: DESC},
-      first: 100,
+      first: $pageSize,
       after: $after
     ) {
       pageInfo {
@@ -147,17 +150,26 @@ def _parse_reviews(pr_node: dict) -> list[Review]:
     return reviews
 
 
-def _run_graphql(query: str, variables: dict, timeout: int = 30) -> dict:
+def _is_gateway_error(err: str) -> bool:
+    """True if the error looks like a GitHub response-size or gateway timeout."""
+    return any(sig in err for sig in _GATEWAY_SIGNALS)
+
+
+def _run_graphql(query: str, variables: dict, timeout: int = 60) -> dict:
     """Execute a GraphQL query via gh api graphql."""
+    # gh api graphql expects -F for non-string types (Int)
+    args = ["gh", "api", "graphql", "-f", f"query={query}"]
+    for k, v in variables.items():
+        if v is None:
+            continue
+        if isinstance(v, int):
+            args.extend(["-F", f"{k}={v}"])
+        else:
+            args.extend(["-f", f"{k}={v}"])
+
     try:
         result = subprocess.run(
-            [
-                "gh", "api", "graphql",
-                "-f", f"query={query}",
-                *[arg for k, v in variables.items() if v is not None
-                  for arg in ("-f", f"{k}={v}")],
-            ],
-            capture_output=True, text=True, check=False, timeout=timeout,
+            args, capture_output=True, text=True, check=False, timeout=timeout,
         )
     except subprocess.TimeoutExpired as err:
         raise RuntimeError("gh api graphql timed out") from err
@@ -173,6 +185,48 @@ def _run_graphql(query: str, variables: dict, timeout: int = 30) -> dict:
     return data
 
 
+def _parse_pr_node(pr: dict, repo: str, lookback_days: int) -> MergedChange | None:
+    """Convert a GraphQL PR node to MergedChange. Returns None if outside window."""
+    merged_at = pr.get("mergedAt")
+    if not merged_at:
+        return None
+
+    merged_dt = datetime.fromisoformat(merged_at.replace("Z", "+00:00"))
+    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    if merged_dt < cutoff:
+        return None
+
+    sha = (pr.get("mergeCommit") or {}).get("oid", "")
+    author = (pr.get("author") or {}).get("login", "")
+    created_at = None
+    if pr.get("createdAt"):
+        created_at = datetime.fromisoformat(pr["createdAt"].replace("Z", "+00:00"))
+
+    files = [
+        f.get("path", "")
+        for f in (pr.get("files", {}).get("nodes", []) or [])
+        if f.get("path")
+    ]
+
+    return MergedChange.build(
+        id=str(pr["number"]),
+        source="github_graphql",
+        repo=repo,
+        title=pr.get("title", ""),
+        body=pr.get("body", "") or "",
+        author=author,
+        merged_at=merged_dt,
+        created_at=created_at,
+        files=files,
+        additions=pr.get("additions", 0) or 0,
+        deletions=pr.get("deletions", 0) or 0,
+        reviews=_parse_reviews(pr),
+        ci_status=_parse_ci_status(pr),
+        merge_commit_sha=sha or None,
+        pr_number=pr["number"],
+    )
+
+
 def fetch_changes(
     repo: str,
     lookback_days: int = 90,
@@ -180,10 +234,13 @@ def fetch_changes(
     limit: int = 0,
     page_size: int = 100,
 ) -> list[MergedChange]:
-    """Fetch merged PRs from GitHub via GraphQL with cursor pagination.
+    """Fetch all merged PRs in the lookback window via GraphQL.
 
-    Unlike the gh CLI adapter, this has no 500-PR ceiling — it paginates
-    automatically. Set limit > 0 to cap the total (0 = no limit).
+    Adaptive page sizing: starts at *page_size*, halves on gateway errors
+    (502/504/timeout), retries the same cursor. Keeps paging until the
+    full lookback window is covered or there are no more pages.
+
+    Set limit > 0 to cap the total number of results (0 = fetch all).
     """
     _validate_repo(repo)
 
@@ -192,66 +249,41 @@ def fetch_changes(
 
     all_changes: list[MergedChange] = []
     cursor: str | None = None
-    pages = 0
+    current_page_size = min(page_size, 100)
 
     while True:
-        pages += 1
         variables = {
             "owner": owner,
             "repo": name,
             "after": cursor,
             "since": since,
+            "pageSize": current_page_size,
         }
 
-        data = _run_graphql(_QUERY, variables)
+        # Fetch with adaptive backoff on gateway errors
+        try:
+            data = _run_graphql(_QUERY, variables)
+        except RuntimeError as exc:
+            if _is_gateway_error(str(exc)) and current_page_size > _MIN_PAGE_SIZE:
+                current_page_size = max(_MIN_PAGE_SIZE, current_page_size // 2)
+                import sys
+                print(
+                    f"  GitHub response too large, reducing page size to {current_page_size}...",
+                    file=sys.stderr,
+                )
+                continue  # retry same cursor with smaller page
+            raise  # non-gateway error or already at minimum — give up
+
         prs_data = data.get("data", {}).get("repository", {}).get("pullRequests", {})
         nodes = prs_data.get("nodes", [])
         page_info = prs_data.get("pageInfo", {})
 
         for pr in nodes:
-            merged_at = pr.get("mergedAt")
-            if not merged_at:
-                continue
-
-            merged_dt = datetime.fromisoformat(merged_at.replace("Z", "+00:00"))
-
-            # Stop if we've gone past the lookback window
-            cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
-            if merged_dt < cutoff:
-                continue
-
-            sha = (pr.get("mergeCommit") or {}).get("oid", "")
-            author = (pr.get("author") or {}).get("login", "")
-            created_at = None
-            if pr.get("createdAt"):
-                created_at = datetime.fromisoformat(pr["createdAt"].replace("Z", "+00:00"))
-
-            files = [
-                f.get("path", "")
-                for f in (pr.get("files", {}).get("nodes", []) or [])
-                if f.get("path")
-            ]
-
-            all_changes.append(MergedChange.build(
-                id=str(pr["number"]),
-                source="github_graphql",
-                repo=repo,
-                title=pr.get("title", ""),
-                body=pr.get("body", "") or "",
-                author=author,
-                merged_at=merged_dt,
-                created_at=created_at,
-                files=files,
-                additions=pr.get("additions", 0) or 0,
-                deletions=pr.get("deletions", 0) or 0,
-                reviews=_parse_reviews(pr),
-                ci_status=_parse_ci_status(pr),
-                merge_commit_sha=sha or None,
-                pr_number=pr["number"],
-            ))
-
-            if 0 < limit <= len(all_changes):
-                return all_changes[:limit]
+            change = _parse_pr_node(pr, repo, lookback_days)
+            if change is not None:
+                all_changes.append(change)
+                if 0 < limit <= len(all_changes):
+                    return all_changes[:limit]
 
         if not page_info.get("hasNextPage"):
             break
@@ -259,5 +291,9 @@ def fetch_changes(
         cursor = page_info.get("endCursor")
         if not cursor:
             break
+
+        # Successful page — try growing back toward original size
+        if current_page_size < page_size:
+            current_page_size = min(page_size, current_page_size * 2)
 
     return all_changes

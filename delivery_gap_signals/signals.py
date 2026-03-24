@@ -41,6 +41,52 @@ REVERT_PR_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# ── Dependency / chore detection ─────────────────────────────────────
+
+_DEP_TITLE_PATTERNS = re.compile(
+    r"^bump\s|"
+    r"^upgrade\s+(?:go|node|python|ruby|java|rust|elixir|swift)\b|"
+    r"^(?:update|upgrade)\s+(?:vendored\s+)?(?:depend|google\.|golang\.|github\.com/|@|npm|pip|cargo|gem)|"
+    r"\b(?:dependabot|renovate|auto.?merge)\b|"
+    r"^chore\(deps\)|^build\(deps\)",
+    re.IGNORECASE,
+)
+
+_DEP_AUTHORS = {
+    "dependabot[bot]", "renovate[bot]", "dependabot", "renovate",
+    "greenkeeper[bot]", "snyk-bot", "depfu[bot]",
+}
+
+LOCK_FILES = {
+    "go.sum", "go.mod", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+    "Cargo.lock", "Gemfile.lock", "poetry.lock", "Pipfile.lock",
+    "composer.lock", "requirements.txt", "shrinkwrap.yaml",
+}
+
+
+def is_dependency_change(
+    title: str,
+    author: str = "",
+    files: list[str] | None = None,
+) -> bool:
+    """Return True if the change is a dependency bump or automated cherry pick.
+
+    Detection uses three signals (any one is sufficient):
+    1. Title matches dependency/bump/upgrade patterns
+    2. Author is a known dependency bot
+    3. All changed files are lock/manifest files
+    """
+    if _DEP_TITLE_PATTERNS.search(title):
+        return True
+    if author.lower() in _DEP_AUTHORS:
+        return True
+    if files:
+        basenames = {f.split("/")[-1] if "/" in f else f for f in files}
+        if basenames and basenames.issubset(LOCK_FILES):
+            return True
+    return False
+
+
 # ── File classification ──────────────────────────────────────────────
 
 IGNORE_FILES = {
