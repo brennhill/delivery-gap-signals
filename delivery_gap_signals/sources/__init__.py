@@ -8,35 +8,40 @@ from pathlib import Path
 
 
 def _github_with_rest_fallback(repo: str, lookback_days: int, limit: int):
-    """Try GraphQL-backed gh pr list first; fall back to pure GraphQL, then REST.
+    """Fetch PRs with a reliable fallback chain.
 
-    NOTE: The REST fallback paginates by most-recently-updated (not merge
-    date), so the result set may differ slightly for repos with many open PRs.
-    This is acceptable — the alternative is no data at all.
+    Order:
+    1. Pure GraphQL (cursor-paginated, adaptive page sizing) — best for
+       large lookback windows. Handles 504s by halving page size.
+    2. REST (paginated by most-recently-updated) — slower but very reliable.
+    3. gh pr list (no pagination) — last resort, capped at one page.
+
+    Each adapter is tried in order. If one fails or returns 0, the next
+    is attempted. This ensures we get the maximum data available.
     """
-    from . import github
-
+    # 1. Pure GraphQL — cursor-paginated, handles large windows
     try:
-        changes = github.fetch_changes(repo, lookback_days, limit=limit)
+        from . import github_graphql
+        changes = github_graphql.fetch_changes(repo, lookback_days, limit=limit)
         if changes:
             return changes
-        # gh pr list --search returned 0 — try pure GraphQL
-        print(
-            f"  gh pr list returned 0 PRs for {repo}, trying pure GraphQL...",
-            file=sys.stderr,
-        )
-        from . import github_graphql
-        return github_graphql.fetch_changes(repo, lookback_days, limit=limit)
+        print(f"  GraphQL returned 0 PRs for {repo}, trying REST...", file=sys.stderr)
     except RuntimeError as exc:
-        err = str(exc)
-        if any(sig in err for sig in ("502", "504", "stream error", "CANCEL", "timed out", "all page sizes exhausted")):
-            print(
-                f"  GraphQL failed for {repo}, falling back to REST adapter...",
-                file=sys.stderr,
-            )
-            from . import github_rest
-            return github_rest.fetch_changes(repo, lookback_days, limit=limit)
-        raise
+        print(f"  GraphQL failed for {repo}: {str(exc)[:80]}...", file=sys.stderr)
+
+    # 2. REST — paginated, slower but reliable
+    try:
+        from . import github_rest
+        changes = github_rest.fetch_changes(repo, lookback_days, limit=limit)
+        if changes:
+            return changes
+        print(f"  REST returned 0 PRs for {repo}, trying gh pr list...", file=sys.stderr)
+    except RuntimeError as exc:
+        print(f"  REST failed for {repo}: {str(exc)[:80]}...", file=sys.stderr)
+
+    # 3. gh pr list — last resort, no real pagination
+    from . import github
+    return github.fetch_changes(repo, lookback_days, limit=limit)
 
 
 def auto_fetch(
