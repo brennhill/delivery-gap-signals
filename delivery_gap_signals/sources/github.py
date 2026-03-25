@@ -95,20 +95,37 @@ def _is_gateway_error(error_msg: str) -> bool:
     return any(sig in error_msg for sig in ("502", "504", "stream error", "CANCEL", "timed out"))
 
 
+def _is_rate_limited(error_msg: str) -> bool:
+    """Check if the error indicates a GitHub rate limit."""
+    low = error_msg.lower()
+    return any(sig in low for sig in ("rate limit", "403", "429", "secondary rate", "abuse"))
+
+
 def _run_gh_pr_list(repo: str, page_size: int, search: str) -> subprocess.CompletedProcess:
-    """Run a single gh pr list call. Returns the CompletedProcess."""
+    """Run a single gh pr list call. Auto-waits on rate limit."""
+    cmd = [
+        "gh", "pr", "list", "--repo", repo,
+        "--state", "merged", "--limit", str(page_size),
+        "--search", search,
+        "--json", _FIELDS,
+    ]
     try:
-        return subprocess.run(
-            [
-                "gh", "pr", "list", "--repo", repo,
-                "--state", "merged", "--limit", str(page_size),
-                "--search", search,
-                "--json", _FIELDS,
-            ],
-            capture_output=True, text=True, check=False, timeout=120,
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=120)
     except subprocess.TimeoutExpired as err:
         raise RuntimeError("gh pr list timed out") from err
+
+    if result.returncode != 0 and _is_rate_limited(result.stderr):
+        import time as _time
+        wait = 900
+        print(f"\n  *** GitHub rate limit hit. Waiting {wait//60} minutes... ***",
+              flush=True)
+        _time.sleep(wait)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=120)
+        except subprocess.TimeoutExpired as err:
+            raise RuntimeError("gh pr list timed out after rate limit wait") from err
+
+    return result
 
 
 def _fetch_pr_batches(repo: str, since_date: str, limit: int) -> list[dict]:

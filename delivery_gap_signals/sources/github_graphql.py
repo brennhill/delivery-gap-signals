@@ -29,6 +29,7 @@ _BOT_PREFIXES = ("copilot-", "coderabbit-", "sourcery-", "pantheon-", "devin-")
 # Uses cursor-based pagination via $after.
 _MIN_PAGE_SIZE = 5
 _GATEWAY_SIGNALS = ("502", "504", "stream error", "CANCEL", "timed out")
+_RATE_LIMIT_SIGNALS = ("rate limit", "API rate limit", "403", "429", "secondary rate", "abuse detection")
 
 _QUERY = """
 query($owner: String!, $repo: String!, $after: String, $pageSize: Int!) {
@@ -210,6 +211,25 @@ def _run_graphql(query: str, variables: dict, timeout: int = 60) -> dict:
         raise RuntimeError("gh api graphql timed out") from err
 
     if result.returncode != 0:
+        err_text = result.stderr.strip()
+        # Rate limit: wait and retry
+        if any(sig in err_text.lower() for sig in _RATE_LIMIT_SIGNALS):
+            import time as _time
+            wait = 900  # 15 minutes
+            print(f"\n  *** GitHub rate limit hit. Waiting {wait//60} minutes... ***",
+                  flush=True)
+            _time.sleep(wait)
+            # Retry once after waiting
+            try:
+                result = subprocess.run(
+                    args, capture_output=True, text=True, check=False, timeout=timeout,
+                )
+            except subprocess.TimeoutExpired as err:
+                raise RuntimeError("gh api graphql timed out (after rate limit wait)") from err
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                if "errors" not in data:
+                    return data
         raise RuntimeError(f"GraphQL query failed: {_sanitize_stderr(result.stderr)}")
 
     data = json.loads(result.stdout)
@@ -330,8 +350,14 @@ def fetch_changes(
     _validate_repo(repo)
 
     owner, name = repo.split("/", 1)
+
+    # For historical fetches, fast-forward to the target window first
+    initial_cursor = None
+    if since and until:
+        initial_cursor = _skip_to_window(owner, name, until)
+
     all_changes: list[MergedChange] = []
-    cursor: str | None = None
+    cursor: str | None = initial_cursor
     # Start small, scale up on success. Avoids wasting API calls on
     # 504s at larger sizes. Most repos work fine at 5; some can handle 25+.
     current_page_size = _MIN_PAGE_SIZE
@@ -364,6 +390,7 @@ def fetch_changes(
         print(f" +{len(nodes)} = {len(all_changes) + len(nodes)} total", flush=True)
 
         added_this_page = 0
+        any_before_since = False
         for pr in nodes:
             change = _parse_pr_node(pr, repo, lookback_days, since=since, until=until)
             if change is not None:
@@ -373,14 +400,26 @@ def fetch_changes(
                     if incremental_path:
                         _save_incremental(incremental_path, all_changes[:limit])
                     return all_changes[:limit]
+            else:
+                # Track if we've gone past the window (older than since)
+                mat = pr.get("mergedAt")
+                if mat and since:
+                    dt = datetime.fromisoformat(mat.replace("Z", "+00:00"))
+                    if dt < since:
+                        any_before_since = True
 
         # Save after every page so no data is lost on interrupt
         if incremental_path and all_changes:
             _save_incremental(incremental_path, all_changes)
 
-        # If we got nodes but none passed the date filter, we've gone
-        # past the lookback window — stop to avoid infinite loop
-        if nodes and added_this_page == 0:
+        # If we found PRs older than our window, we've passed it — stop
+        if any_before_since:
+            break
+
+        # If we got nodes but none matched and none were too old,
+        # we're still approaching the window — keep paging
+        # (unless there's no since filter, then old behavior applies)
+        if nodes and added_this_page == 0 and not since:
             break
 
         if not page_info.get("hasNextPage"):
@@ -397,3 +436,85 @@ def fetch_changes(
             consecutive_successes = 0
 
     return all_changes
+
+
+def _skip_to_window(
+    owner: str, name: str, until: datetime,
+) -> str | None:
+    """Skip ahead through pages to find the cursor near `until`.
+
+    Uses large page sizes to jump fast, checks the oldest PR on each
+    page. Once we find a page containing PRs near or before `until`,
+    return that cursor as the starting point for detailed collection.
+    """
+    cursor: str | None = None
+    prev_cursor: str | None = None
+    skip_size = 25  # Start moderate, GitHub often 504s at 100
+
+    print(f"    Skipping ahead to find window (before {until.strftime('%Y-%m-%d')})...", flush=True)
+    pages_skipped = 0
+
+    while True:
+        variables = {
+            "owner": owner,
+            "repo": name,
+            "after": cursor,
+            "pageSize": skip_size,
+        }
+
+        try:
+            data = _run_graphql(_QUERY, variables)
+        except RuntimeError as exc:
+            if _is_gateway_error(str(exc)) and skip_size > _MIN_PAGE_SIZE:
+                skip_size = max(_MIN_PAGE_SIZE, skip_size // 2)
+                print(f"    skip: got {exc}, backing down to size={skip_size}", flush=True)
+                continue
+            # If we can't even skip at min size, fall back to no skip
+            print(f"    skip: failed ({exc}), starting from beginning", flush=True)
+            return None
+
+        prs_data = data.get("data", {}).get("repository", {}).get("pullRequests", {})
+        nodes = prs_data.get("nodes", [])
+        page_info = prs_data.get("pageInfo", {})
+
+        if not nodes:
+            print(f"    skip: exhausted all PRs after {pages_skipped} pages", flush=True)
+            return cursor
+
+        # Check newest and oldest PR on this page
+        newest_on_page = None
+        oldest_on_page = None
+        for pr in nodes:
+            mat = pr.get("mergedAt") or pr.get("updatedAt")
+            if mat:
+                dt = datetime.fromisoformat(mat.replace("Z", "+00:00"))
+                if newest_on_page is None or dt > newest_on_page:
+                    newest_on_page = dt
+                if oldest_on_page is None or dt < oldest_on_page:
+                    oldest_on_page = dt
+
+        pages_skipped += 1
+        total_skipped = pages_skipped * skip_size
+        newest_str = newest_on_page.strftime('%Y-%m-%d') if newest_on_page else '?'
+        oldest_str = oldest_on_page.strftime('%Y-%m-%d') if oldest_on_page else '?'
+        target_str = until.strftime('%Y-%m-%d')
+
+        if oldest_on_page and oldest_on_page <= until:
+            print(f"    skip: page {pages_skipped} spans {newest_str}..{oldest_str}, "
+                  f"reached target {target_str} — starting collection "
+                  f"({total_skipped} PRs skipped)", flush=True)
+            return prev_cursor
+        else:
+            print(f"    skip: page {pages_skipped} spans {newest_str}..{oldest_str}, "
+                  f"still above target {target_str} — jumping ahead "
+                  f"({total_skipped} PRs skipped so far)", flush=True)
+
+        prev_cursor = cursor
+        if not page_info.get("hasNextPage"):
+            print(f"    skip: reached end of repo after {pages_skipped} pages, "
+                  f"no PRs in window", flush=True)
+            return cursor
+
+        cursor = page_info.get("endCursor")
+        if not cursor:
+            return prev_cursor

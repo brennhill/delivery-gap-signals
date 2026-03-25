@@ -52,6 +52,21 @@ def _gh_rest(endpoint: str, *, timeout: int = 30) -> list | dict:
         raise RuntimeError(f"gh api timed out: {endpoint}") from err
 
     if result.returncode != 0:
+        err_text = result.stderr.strip().lower()
+        if any(sig in err_text for sig in ("rate limit", "403", "429", "secondary rate", "abuse")):
+            import time as _time
+            wait = 900
+            print(f"\n  *** GitHub rate limit hit (REST). Waiting {wait//60} minutes... ***",
+                  flush=True)
+            _time.sleep(wait)
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout)
+            except subprocess.TimeoutExpired as err:
+                raise RuntimeError(f"gh api timed out after rate limit wait: {endpoint}") from err
+            if result.returncode == 0:
+                stdout = result.stdout.strip()
+                if stdout:
+                    return json.loads(stdout)
         raise RuntimeError(f"gh api failed: {_sanitize_stderr(result.stderr)}")
 
     stdout = result.stdout.strip()
