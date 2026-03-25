@@ -27,6 +27,15 @@ class Review:
     state: str          # "approved", "changes_requested", "commented"
     submitted_at: datetime
     is_bot: bool = False
+    body: str = ""      # Review comment text (empty if not fetched)
+
+
+@dataclass(frozen=True)
+class Commit:
+    """A single commit in a change."""
+    message: str
+    sha: str = ""
+    authored_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -63,6 +72,14 @@ class MergedChange:
     reviews: list[Review] | None = None
     ci_status: CIStatus | None = None
 
+    # Commit data
+    commits: list[Commit] = field(default_factory=list)
+    commit_count: int = 0
+
+    # Engagement metadata
+    last_edited_at: datetime | None = None   # PR body was edited after creation
+    total_comments_count: int = 0            # PR + review comments
+
     # Platform-specific identifiers
     merge_commit_sha: str | None = None
     pr_number: int | None = None
@@ -86,6 +103,10 @@ class MergedChange:
         ci_status: CIStatus | None = None,
         merge_commit_sha: str | None = None,
         pr_number: int | None = None,
+        commits: list[Commit] | None = None,
+        commit_count: int = 0,
+        last_edited_at: datetime | None = None,
+        total_comments_count: int = 0,
     ) -> MergedChange:
         """Validated constructor. Auto-extracts ticket IDs from title + body."""
         text = f"{title}\n{body}".strip()
@@ -106,6 +127,10 @@ class MergedChange:
             ci_status=ci_status,
             merge_commit_sha=merge_commit_sha,
             pr_number=pr_number,
+            commits=commits or [],
+            commit_count=commit_count,
+            last_edited_at=last_edited_at,
+            total_comments_count=total_comments_count,
         )
 
     def to_dict(self) -> dict:
@@ -132,8 +157,20 @@ class MergedChange:
                     "state": r.state,
                     "submitted_at": r.submitted_at.isoformat(),
                     "is_bot": r.is_bot,
+                    "body": r.body,
                 }
                 for r in (self.reviews or [])
             ],
+            "commits": [
+                {
+                    "message": c.message,
+                    "sha": c.sha,
+                    "authored_at": c.authored_at.isoformat() if c.authored_at else None,
+                }
+                for c in (self.commits or [])
+            ],
+            "commit_count": self.commit_count,
+            "last_edited_at": self.last_edited_at.isoformat() if self.last_edited_at else None,
+            "total_comments_count": self.total_comments_count,
         }
         return d

@@ -13,7 +13,7 @@ import re
 import subprocess
 from datetime import datetime, timedelta, timezone
 
-from ..models import CIStatus, MergedChange, Review
+from ..models import CIStatus, Commit, MergedChange, Review
 
 _REPO_PATTERN = re.compile(r"^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$")
 
@@ -49,6 +49,8 @@ query($owner: String!, $repo: String!, $after: String, $pageSize: Int!) {
         body
         mergedAt
         createdAt
+        lastEditedAt
+        totalCommentsCount
         additions
         deletions
         author { login }
@@ -61,11 +63,14 @@ query($owner: String!, $repo: String!, $after: String, $pageSize: Int!) {
             author { login }
             state
             submittedAt
+            body
           }
         }
-        commits(last: 1) {
+        commits(first: 100) {
+          totalCount
           nodes {
             commit {
+              message
               statusCheckRollup {
                 contexts(first: 50) {
                   nodes {
@@ -150,8 +155,34 @@ def _parse_reviews(pr_node: dict) -> list[Review]:
             state=state,
             submitted_at=datetime.fromisoformat(submitted.replace("Z", "+00:00")),
             is_bot=_is_bot_reviewer(login),
+            body=(r.get("body") or "")[:2000],
         ))
     return reviews
+
+
+def _parse_commits(pr_node: dict) -> tuple[list[Commit], int]:
+    """Parse commits from GraphQL response. Returns (commits, total_count)."""
+    commits_data = pr_node.get("commits", {})
+    total_count = commits_data.get("totalCount", 0)
+    commits = []
+    for node in commits_data.get("nodes", []) or []:
+        commit = node.get("commit", {})
+        message = commit.get("message", "")
+        # Extract authored date from commit if available
+        author_info = commit.get("author", {}) or {}
+        authored_at = None
+        date_str = author_info.get("date", "")
+        if date_str:
+            try:
+                authored_at = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                pass
+        commits.append(Commit(
+            message=message,
+            sha=node.get("oid", ""),
+            authored_at=authored_at,
+        ))
+    return commits, total_count
 
 
 def _is_gateway_error(err: str) -> bool:
@@ -222,6 +253,17 @@ def _parse_pr_node(
         if f.get("path")
     ]
 
+    # Parse commits
+    commits, commit_count = _parse_commits(pr)
+
+    # Parse edit timestamp
+    last_edited_at = None
+    if pr.get("lastEditedAt"):
+        try:
+            last_edited_at = datetime.fromisoformat(pr["lastEditedAt"].replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            pass
+
     return MergedChange.build(
         id=str(pr["number"]),
         source="github_graphql",
@@ -238,6 +280,10 @@ def _parse_pr_node(
         ci_status=_parse_ci_status(pr),
         merge_commit_sha=sha or None,
         pr_number=pr["number"],
+        commits=commits,
+        commit_count=commit_count,
+        last_edited_at=last_edited_at,
+        total_comments_count=pr.get("totalCommentsCount", 0) or 0,
     )
 
 
