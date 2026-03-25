@@ -15,9 +15,12 @@ from datetime import datetime, timedelta, timezone
 from ..models import CIStatus, MergedChange, Review
 
 _BOT_REVIEWERS = {
-    "copilot", "github-copilot", "coderabbitai", "codium-ai",
-    "sourcery-ai", "ellipsis-dev", "greptile-bot",
+    "copilot", "github-copilot", "copilot-pull-request-reviewer",
+    "copilot-swe-agent", "coderabbitai", "codium-ai",
+    "sourcery-ai", "ellipsis-dev", "greptile-bot", "pantheon-ai",
+    "promptfoo-scanner", "cubic-dev-ai", "devin-ai-integration",
 }
+_BOT_PREFIXES = ("copilot-", "coderabbit-", "sourcery-", "pantheon-", "devin-")
 
 _REPO_PATTERN = re.compile(r"^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$")
 
@@ -30,7 +33,8 @@ def _validate_repo(repo: str) -> None:
 
 
 def _is_bot_reviewer(login: str) -> bool:
-    return login.endswith("[bot]") or login.lower() in _BOT_REVIEWERS
+    low = login.lower()
+    return login.endswith("[bot]") or low in _BOT_REVIEWERS or low.startswith(_BOT_PREFIXES)
 
 
 def _sanitize_stderr(stderr: str, max_len: int = 200) -> str:
@@ -54,7 +58,18 @@ def _gh_rest(endpoint: str, *, timeout: int = 30) -> list | dict:
     if not stdout:
         return []
 
-    return json.loads(stdout)
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        # Truncated response — try to salvage by finding the last complete
+        # JSON object/array boundary
+        for end in range(len(stdout) - 1, 0, -1):
+            if stdout[end] in (']', '}'):
+                try:
+                    return json.loads(stdout[:end + 1])
+                except json.JSONDecodeError:
+                    continue
+        raise RuntimeError(f"gh api returned unparseable JSON for {endpoint}")
 
 
 def _fetch_pr_list(repo: str, since: str, limit: int) -> list[dict]:

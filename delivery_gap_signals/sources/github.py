@@ -12,9 +12,12 @@ from ..models import CIStatus, MergedChange, Review
 
 # Known bot/LLM reviewer accounts
 _BOT_REVIEWERS = {
-    "copilot", "github-copilot", "coderabbitai", "codium-ai",
-    "sourcery-ai", "ellipsis-dev", "greptile-bot",
+    "copilot", "github-copilot", "copilot-pull-request-reviewer",
+    "copilot-swe-agent", "coderabbitai", "codium-ai",
+    "sourcery-ai", "ellipsis-dev", "greptile-bot", "pantheon-ai",
+    "promptfoo-scanner", "cubic-dev-ai", "devin-ai-integration",
 }
+_BOT_PREFIXES = ("copilot-", "coderabbit-", "sourcery-", "pantheon-", "devin-")
 
 _REPO_PATTERN = re.compile(r"^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$")
 
@@ -27,7 +30,8 @@ def _validate_repo(repo: str) -> None:
 
 
 def _is_bot_reviewer(login: str) -> bool:
-    return login.endswith("[bot]") or login.lower() in _BOT_REVIEWERS
+    low = login.lower()
+    return login.endswith("[bot]") or low in _BOT_REVIEWERS or low.startswith(_BOT_PREFIXES)
 
 
 def _parse_ci_status(pr: dict) -> CIStatus | None:
@@ -194,6 +198,62 @@ def _fetch_pr_batches(repo: str, since_date: str, limit: int) -> list[dict]:
     return items[:limit]
 
 
+def _fetch_pr_batches_no_search(repo: str, since_date: str, limit: int) -> list[dict]:
+    """Fallback: fetch PRs without --search and filter by date client-side.
+
+    gh pr list without --search returns most-recently-merged first. Uses
+    small page sizes to avoid GraphQL gateway errors on large repos.
+    """
+    items: list[dict] = []
+    seen: set[int] = set()
+
+    # Use smaller fields to avoid GraphQL payload limits — drop commits
+    # and statusCheckRollup which are the heaviest nested fields.
+    light_fields = (
+        "number,title,mergedAt,files,mergeCommit,body,"
+        "additions,deletions,reviews,labels,author,createdAt"
+    )
+
+    for page_size in [100, 50, 25]:
+        fetch_limit = min(limit, 500)
+        try:
+            result = subprocess.run(
+                [
+                    "gh", "pr", "list", "--repo", repo,
+                    "--state", "merged", "--limit", str(fetch_limit),
+                    "--json", light_fields,
+                ],
+                capture_output=True, text=True, check=False, timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            continue  # try smaller page size
+
+        if result.returncode != 0:
+            err_msg = _sanitize_stderr(result.stderr)
+            if _is_gateway_error(err_msg):
+                print(
+                    f"  no-search fallback: {err_msg[:40]}... retrying smaller...",
+                    file=sys.stderr,
+                )
+                continue  # try smaller page size
+            raise RuntimeError(f"gh pr list (no-search fallback) failed: {err_msg}")
+
+        batch = json.loads(result.stdout)
+        for pr in batch:
+            merged_at = pr.get("mergedAt", "")
+            if not merged_at:
+                continue
+            if merged_at[:10] < since_date:
+                continue
+            num = pr.get("number")
+            if num not in seen:
+                seen.add(num)
+                items.append(pr)
+        break  # success — don't retry
+
+    return items[:limit]
+
+
 def fetch_changes(
     repo: str,
     lookback_days: int = 90,
@@ -205,11 +265,24 @@ def fetch_changes(
     Pages until the full lookback window is covered. The limit parameter
     is a safety cap, not a target — the time window is the primary constraint.
     Auto-adjusts page size on GraphQL errors (50 -> 25 -> 10).
+
+    If --search "merged:>=DATE" returns 0 results (known silent failure on
+    some repos), falls back to fetching without --search and filtering
+    client-side by merge date.
     """
     _validate_repo(repo)
 
     since_date = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     prs = _fetch_pr_batches(repo, since_date, limit)
+
+    # Fallback: --search "merged:>=DATE" silently returns [] on some repos.
+    # Fetch without --search and filter client-side.
+    if not prs:
+        print(
+            f"  --search returned 0 PRs for {repo}, retrying without search filter...",
+            file=sys.stderr,
+        )
+        prs = _fetch_pr_batches_no_search(repo, since_date, limit)
 
     changes: list[MergedChange] = []
     for pr in prs:
