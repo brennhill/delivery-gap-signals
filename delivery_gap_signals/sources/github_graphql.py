@@ -231,12 +231,34 @@ def _parse_pr_node(pr: dict, repo: str, lookback_days: int) -> MergedChange | No
     )
 
 
+def _save_incremental(path: str, changes: list[MergedChange]) -> None:
+    """Save fetched PRs to disk after each page. Merges with existing data."""
+    import json as _json
+    from pathlib import Path as _Path
+
+    p = _Path(path)
+    existing = {}
+    if p.exists():
+        try:
+            for pr in _json.loads(p.read_text()):
+                existing[pr.get("pr_number")] = pr
+        except Exception:
+            pass
+
+    for c in changes:
+        d = c.to_dict()
+        existing[d.get("pr_number")] = d
+
+    p.write_text(_json.dumps(list(existing.values()), indent=2, default=str))
+
+
 def fetch_changes(
     repo: str,
     lookback_days: int = 90,
     *,
     limit: int = 0,
     page_size: int = 15,
+    incremental_path: str | None = None,
 ) -> list[MergedChange]:
     """Fetch all merged PRs in the lookback window via GraphQL.
 
@@ -287,7 +309,13 @@ def fetch_changes(
             if change is not None:
                 all_changes.append(change)
                 if 0 < limit <= len(all_changes):
+                    if incremental_path:
+                        _save_incremental(incremental_path, all_changes[:limit])
                     return all_changes[:limit]
+
+        # Save after every page so no data is lost on interrupt
+        if incremental_path and all_changes:
+            _save_incremental(incremental_path, all_changes)
 
         if not page_info.get("hasNextPage"):
             break
