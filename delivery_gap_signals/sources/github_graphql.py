@@ -189,16 +189,26 @@ def _run_graphql(query: str, variables: dict, timeout: int = 60) -> dict:
     return data
 
 
-def _parse_pr_node(pr: dict, repo: str, lookback_days: int) -> MergedChange | None:
+def _parse_pr_node(
+    pr: dict, repo: str, lookback_days: int,
+    since: datetime | None = None, until: datetime | None = None,
+) -> MergedChange | None:
     """Convert a GraphQL PR node to MergedChange. Returns None if outside window."""
     merged_at = pr.get("mergedAt")
     if not merged_at:
         return None
 
     merged_dt = datetime.fromisoformat(merged_at.replace("Z", "+00:00"))
-    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
-    if merged_dt < cutoff:
+
+    # Fixed window takes precedence over lookback_days
+    if since and merged_dt < since:
         return None
+    if until and merged_dt > until:
+        return None
+    if not since:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+        if merged_dt < cutoff:
+            return None
 
     sha = (pr.get("mergeCommit") or {}).get("oid", "")
     author = (pr.get("author") or {}).get("login", "")
@@ -259,14 +269,17 @@ def fetch_changes(
     limit: int = 0,
     page_size: int = 15,
     incremental_path: str | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
 ) -> list[MergedChange]:
-    """Fetch all merged PRs in the lookback window via GraphQL.
+    """Fetch all merged PRs in a time window via GraphQL.
 
-    Adaptive page sizing: starts at *page_size*, halves on gateway errors
-    (502/504/timeout), retries the same cursor. Keeps paging until the
-    full lookback window is covered or there are no more pages.
+    Time window options (in priority order):
+    - since/until: fixed date window (for historical fetches)
+    - lookback_days: N days from now (default)
 
-    Set limit > 0 to cap the total number of results (0 = fetch all).
+    Adaptive page sizing: starts at min page size, scales up on
+    consecutive successes. Set limit > 0 to cap total results.
     """
     _validate_repo(repo)
 
@@ -305,7 +318,7 @@ def fetch_changes(
         print(f" +{len(nodes)} = {len(all_changes) + len(nodes)} total", flush=True)
 
         for pr in nodes:
-            change = _parse_pr_node(pr, repo, lookback_days)
+            change = _parse_pr_node(pr, repo, lookback_days, since=since, until=until)
             if change is not None:
                 all_changes.append(change)
                 if 0 < limit <= len(all_changes):
