@@ -264,29 +264,23 @@ def fetch_changes(
             "pageSize": current_page_size,
         }
 
-        import sys
-        print(f"  [{len(all_changes)} PRs] fetching page (size={current_page_size})...",
-              end="", flush=True, file=sys.stderr)
+        print(f"    [{len(all_changes):4d} PRs] page size={current_page_size}...", end="", flush=True)
 
         try:
             data = _run_graphql(_QUERY, variables)
         except RuntimeError as exc:
-            print(" FAILED", file=sys.stderr)
+            print(f" FAILED", flush=True)
             if _is_gateway_error(str(exc)) and current_page_size > _MIN_PAGE_SIZE:
                 current_page_size = max(_MIN_PAGE_SIZE, current_page_size // 2)
                 consecutive_successes = 0
-                import sys
-                print(
-                    f"  page_size {current_page_size * 2} failed, backing down to {current_page_size}...",
-                    file=sys.stderr,
-                )
-                continue  # retry same cursor with smaller page
+                print(f"    backing down to size={current_page_size}", flush=True)
+                continue
             raise
 
         prs_data = data.get("data", {}).get("repository", {}).get("pullRequests", {})
         nodes = prs_data.get("nodes", [])
         page_info = prs_data.get("pageInfo", {})
-        print(f" +{len(nodes)}", file=sys.stderr, flush=True)
+        print(f" +{len(nodes)} = {len(all_changes) + len(nodes)} total", flush=True)
 
         for pr in nodes:
             change = _parse_pr_node(pr, repo, lookback_days)
