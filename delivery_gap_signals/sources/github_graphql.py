@@ -251,7 +251,10 @@ def fetch_changes(
     owner, name = repo.split("/", 1)
     all_changes: list[MergedChange] = []
     cursor: str | None = None
-    current_page_size = min(page_size, 100)
+    # Start small, scale up on success. Avoids wasting API calls on
+    # 504s at larger sizes. Most repos work fine at 5; some can handle 25+.
+    current_page_size = _MIN_PAGE_SIZE
+    consecutive_successes = 0
 
     while True:
         variables = {
@@ -261,19 +264,19 @@ def fetch_changes(
             "pageSize": current_page_size,
         }
 
-        # Fetch with adaptive backoff on gateway errors
         try:
             data = _run_graphql(_QUERY, variables)
         except RuntimeError as exc:
             if _is_gateway_error(str(exc)) and current_page_size > _MIN_PAGE_SIZE:
                 current_page_size = max(_MIN_PAGE_SIZE, current_page_size // 2)
+                consecutive_successes = 0
                 import sys
                 print(
-                    f"  GitHub response too large, reducing page size to {current_page_size}...",
+                    f"  page_size {current_page_size * 2} failed, backing down to {current_page_size}...",
                     file=sys.stderr,
                 )
                 continue  # retry same cursor with smaller page
-            raise  # non-gateway error or already at minimum — give up
+            raise
 
         prs_data = data.get("data", {}).get("repository", {}).get("pullRequests", {})
         nodes = prs_data.get("nodes", [])
@@ -293,8 +296,10 @@ def fetch_changes(
         if not cursor:
             break
 
-        # Successful page — try growing back toward original size
-        if current_page_size < page_size:
+        # Scale up on consecutive successes
+        consecutive_successes += 1
+        if consecutive_successes >= 3 and current_page_size < page_size:
             current_page_size = min(page_size, current_page_size * 2)
+            consecutive_successes = 0
 
     return all_changes
