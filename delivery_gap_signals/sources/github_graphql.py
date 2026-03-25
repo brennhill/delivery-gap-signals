@@ -18,9 +18,12 @@ from ..models import CIStatus, MergedChange, Review
 _REPO_PATTERN = re.compile(r"^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$")
 
 _BOT_REVIEWERS = {
-    "copilot", "github-copilot", "coderabbitai", "codium-ai",
-    "sourcery-ai", "ellipsis-dev", "greptile-bot",
+    "copilot", "github-copilot", "copilot-pull-request-reviewer",
+    "copilot-swe-agent", "coderabbitai", "codium-ai",
+    "sourcery-ai", "ellipsis-dev", "greptile-bot", "pantheon-ai",
+    "promptfoo-scanner", "cubic-dev-ai", "devin-ai-integration",
 }
+_BOT_PREFIXES = ("copilot-", "coderabbit-", "sourcery-", "pantheon-", "devin-")
 
 # GraphQL query — fetches merged PRs with reviews, commits, files, and CI status.
 # Uses cursor-based pagination via $after.
@@ -28,7 +31,7 @@ _MIN_PAGE_SIZE = 5
 _GATEWAY_SIGNALS = ("502", "504", "stream error", "CANCEL", "timed out")
 
 _QUERY = """
-query($owner: String!, $repo: String!, $after: String, $since: DateTime!, $pageSize: Int!) {
+query($owner: String!, $repo: String!, $after: String, $pageSize: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequests(
       states: MERGED,
@@ -102,7 +105,8 @@ def _validate_repo(repo: str) -> None:
 
 
 def _is_bot_reviewer(login: str) -> bool:
-    return login.endswith("[bot]") or login.lower() in _BOT_REVIEWERS
+    low = login.lower()
+    return login.endswith("[bot]") or low in _BOT_REVIEWERS or low.startswith(_BOT_PREFIXES)
 
 
 def _parse_ci_status(pr_node: dict) -> CIStatus | None:
@@ -232,7 +236,7 @@ def fetch_changes(
     lookback_days: int = 90,
     *,
     limit: int = 0,
-    page_size: int = 100,
+    page_size: int = 15,
 ) -> list[MergedChange]:
     """Fetch all merged PRs in the lookback window via GraphQL.
 
@@ -245,8 +249,6 @@ def fetch_changes(
     _validate_repo(repo)
 
     owner, name = repo.split("/", 1)
-    since = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
-
     all_changes: list[MergedChange] = []
     cursor: str | None = None
     current_page_size = min(page_size, 100)
@@ -256,7 +258,6 @@ def fetch_changes(
             "owner": owner,
             "repo": name,
             "after": cursor,
-            "since": since,
             "pageSize": current_page_size,
         }
 

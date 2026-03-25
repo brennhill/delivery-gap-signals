@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 def _github_with_rest_fallback(repo: str, lookback_days: int, limit: int):
-    """Try GraphQL-backed gh pr list first; fall back to REST on gateway errors.
+    """Try GraphQL-backed gh pr list first; fall back to pure GraphQL, then REST.
 
     NOTE: The REST fallback paginates by most-recently-updated (not merge
     date), so the result set may differ slightly for repos with many open PRs.
@@ -17,7 +17,16 @@ def _github_with_rest_fallback(repo: str, lookback_days: int, limit: int):
     from . import github
 
     try:
-        return github.fetch_changes(repo, lookback_days, limit=limit)
+        changes = github.fetch_changes(repo, lookback_days, limit=limit)
+        if changes:
+            return changes
+        # gh pr list --search returned 0 — try pure GraphQL
+        print(
+            f"  gh pr list returned 0 PRs for {repo}, trying pure GraphQL...",
+            file=sys.stderr,
+        )
+        from . import github_graphql
+        return github_graphql.fetch_changes(repo, lookback_days, limit=limit)
     except RuntimeError as exc:
         err = str(exc)
         if any(sig in err for sig in ("502", "504", "stream error", "CANCEL", "timed out", "all page sizes exhausted")):

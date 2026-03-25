@@ -80,8 +80,8 @@ def _sanitize_stderr(stderr: str, max_len: int = 200) -> str:
     return text
 
 
-_PAGE_SIZE = 50
-_PAGE_SIZE_FALLBACKS = [25, 10]
+_PAGE_SIZE = 15
+_PAGE_SIZE_FALLBACKS = [10, 5]
 _HARD_LIMIT = 5000  # absolute safety cap regardless of time window
 _FIELDS = (
     "number,title,mergedAt,files,mergeCommit,body,"
