@@ -363,10 +363,12 @@ def fetch_changes(
         page_info = prs_data.get("pageInfo", {})
         print(f" +{len(nodes)} = {len(all_changes) + len(nodes)} total", flush=True)
 
+        added_this_page = 0
         for pr in nodes:
             change = _parse_pr_node(pr, repo, lookback_days, since=since, until=until)
             if change is not None:
                 all_changes.append(change)
+                added_this_page += 1
                 if 0 < limit <= len(all_changes):
                     if incremental_path:
                         _save_incremental(incremental_path, all_changes[:limit])
@@ -375,6 +377,11 @@ def fetch_changes(
         # Save after every page so no data is lost on interrupt
         if incremental_path and all_changes:
             _save_incremental(incremental_path, all_changes)
+
+        # If we got nodes but none passed the date filter, we've gone
+        # past the lookback window — stop to avoid infinite loop
+        if nodes and added_this_page == 0:
+            break
 
         if not page_info.get("hasNextPage"):
             break
