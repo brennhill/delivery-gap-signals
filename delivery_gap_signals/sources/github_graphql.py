@@ -351,13 +351,13 @@ def fetch_changes(
 
     owner, name = repo.split("/", 1)
 
-    # For historical fetches, fast-forward to the target window first
-    initial_cursor = None
-    if since and until:
-        initial_cursor = _skip_to_window(owner, name, until)
-
+    # Skip optimization disabled — GitHub orders by UPDATED_AT not
+    # MERGED_AT, so skip_to_window jumps around non-monotonically.
+    # For historical fetches we page through everything and filter
+    # client-side. The "added_this_page == 0 and any_before_since"
+    # check below stops us once we're past the window.
     all_changes: list[MergedChange] = []
-    cursor: str | None = initial_cursor
+    cursor: str | None = None
     # Start small, scale up on success. Avoids wasting API calls on
     # 504s at larger sizes. Most repos work fine at 5; some can handle 25+.
     current_page_size = _MIN_PAGE_SIZE
