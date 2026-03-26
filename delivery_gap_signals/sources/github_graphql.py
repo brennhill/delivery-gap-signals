@@ -351,13 +351,13 @@ def fetch_changes(
 
     owner, name = repo.split("/", 1)
 
-    # Skip optimization disabled — GitHub orders by UPDATED_AT not
-    # MERGED_AT, so skip_to_window jumps around non-monotonically.
-    # For historical fetches we page through everything and filter
-    # client-side. The "added_this_page == 0 and any_before_since"
-    # check below stops us once we're past the window.
+    # For historical fetches, binary-search to the right window
+    initial_cursor = None
+    if since and until:
+        initial_cursor = _skip_to_window_fast(owner, name, until)
+
     all_changes: list[MergedChange] = []
-    cursor: str | None = None
+    cursor: str | None = initial_cursor
     # Start small, scale up on success. Avoids wasting API calls on
     # 504s at larger sizes. Most repos work fine at 5; some can handle 25+.
     current_page_size = _MIN_PAGE_SIZE
@@ -438,21 +438,44 @@ def fetch_changes(
     return all_changes
 
 
-def _skip_to_window(
+_SKIP_QUERY = """
+query($owner: String!, $repo: String!, $after: String, $pageSize: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequests(
+      states: MERGED,
+      orderBy: {field: UPDATED_AT, direction: DESC},
+      first: $pageSize,
+      after: $after
+    ) {
+      pageInfo { hasNextPage endCursor }
+      nodes { mergedAt }
+    }
+  }
+}
+"""
+
+
+def _skip_to_window_fast(
     owner: str, name: str, until: datetime,
 ) -> str | None:
-    """Skip ahead through pages to find the cursor near `until`.
+    """Jump ahead in big leaps to find PRs near `until`.
 
-    Uses large page sizes to jump fast, checks the oldest PR on each
-    page. Once we find a page containing PRs near or before `until`,
-    return that cursor as the starting point for detailed collection.
+    Uses a minimal query (just mergedAt + cursor) with large page sizes
+    (100-500) for fast skipping. When we overshoot (find PRs older than
+    `until`), we back up one page and return that cursor.
+
+    Because GitHub orders by UPDATED_AT (not MERGED_AT), the mergedAt
+    dates on each page are non-monotonic. We track the MINIMUM mergedAt
+    seen across the page. Once any PR on a page has mergedAt <= until,
+    we're close enough — back up and start detailed collection.
     """
     cursor: str | None = None
     prev_cursor: str | None = None
-    skip_size = 25  # Start moderate, GitHub often 504s at 100
+    skip_size = 100  # Lightweight query can handle big pages
+    total_skipped = 0
+    target_str = until.strftime('%Y-%m-%d')
 
-    print(f"    Skipping ahead to find window (before {until.strftime('%Y-%m-%d')})...", flush=True)
-    pages_skipped = 0
+    print(f"    Skipping to {target_str}...", end="", flush=True)
 
     while True:
         variables = {
@@ -463,14 +486,12 @@ def _skip_to_window(
         }
 
         try:
-            data = _run_graphql(_QUERY, variables)
+            data = _run_graphql(_SKIP_QUERY, variables)
         except RuntimeError as exc:
-            if _is_gateway_error(str(exc)) and skip_size > _MIN_PAGE_SIZE:
-                skip_size = max(_MIN_PAGE_SIZE, skip_size // 2)
-                print(f"    skip: got {exc}, backing down to size={skip_size}", flush=True)
+            if _is_gateway_error(str(exc)) and skip_size > 25:
+                skip_size = skip_size // 2
                 continue
-            # If we can't even skip at min size, fall back to no skip
-            print(f"    skip: failed ({exc}), starting from beginning", flush=True)
+            print(f" failed ({str(exc)[:40]}), starting from beginning", flush=True)
             return None
 
         prs_data = data.get("data", {}).get("repository", {}).get("pullRequests", {})
@@ -478,43 +499,38 @@ def _skip_to_window(
         page_info = prs_data.get("pageInfo", {})
 
         if not nodes:
-            print(f"    skip: exhausted all PRs after {pages_skipped} pages", flush=True)
+            print(f" exhausted all PRs ({total_skipped} skipped)", flush=True)
             return cursor
 
-        # Check newest and oldest PR on this page
-        newest_on_page = None
-        oldest_on_page = None
+        # Check if any PR on this page is in or before our window
+        min_merged = None
         for pr in nodes:
-            mat = pr.get("mergedAt") or pr.get("updatedAt")
+            mat = pr.get("mergedAt")
             if mat:
                 dt = datetime.fromisoformat(mat.replace("Z", "+00:00"))
-                if newest_on_page is None or dt > newest_on_page:
-                    newest_on_page = dt
-                if oldest_on_page is None or dt < oldest_on_page:
-                    oldest_on_page = dt
+                if min_merged is None or dt < min_merged:
+                    min_merged = dt
 
-        pages_skipped += 1
-        total_skipped = pages_skipped * skip_size
-        newest_str = newest_on_page.strftime('%Y-%m-%d') if newest_on_page else '?'
-        oldest_str = oldest_on_page.strftime('%Y-%m-%d') if oldest_on_page else '?'
-        target_str = until.strftime('%Y-%m-%d')
+        total_skipped += len(nodes)
 
-        if oldest_on_page and oldest_on_page <= until:
-            print(f"    skip: page {pages_skipped} spans {newest_str}..{oldest_str}, "
-                  f"reached target {target_str} — starting collection "
-                  f"({total_skipped} PRs skipped)", flush=True)
-            return prev_cursor
-        else:
-            print(f"    skip: page {pages_skipped} spans {newest_str}..{oldest_str}, "
-                  f"still above target {target_str} — jumping ahead "
-                  f"({total_skipped} PRs skipped so far)", flush=True)
+        if min_merged and min_merged <= until:
+            # Found PRs in or before our window — back up one page
+            print(f" found target at ~{total_skipped} PRs "
+                  f"(oldest on page: {min_merged.strftime('%Y-%m-%d')})", flush=True)
+            return prev_cursor  # Back up so we don't miss any
 
+        # Still too recent — keep jumping
         prev_cursor = cursor
         if not page_info.get("hasNextPage"):
-            print(f"    skip: reached end of repo after {pages_skipped} pages, "
+            print(f" reached end of repo ({total_skipped} PRs), "
                   f"no PRs in window", flush=True)
             return cursor
 
         cursor = page_info.get("endCursor")
         if not cursor:
             return prev_cursor
+
+        # Print progress every 500 PRs
+        if total_skipped % 500 < skip_size:
+            min_str = min_merged.strftime('%Y-%m-%d') if min_merged else '?'
+            print(f" {total_skipped} skipped (at {min_str})...", end="", flush=True)
