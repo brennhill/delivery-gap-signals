@@ -353,8 +353,14 @@ def fetch_changes(
 
     # For historical fetches, binary-search to the right window
     initial_cursor = None
+    skip_exhausted = False
     if since and until:
-        initial_cursor = _skip_to_window_fast(owner, name, until)
+        result = _skip_to_window_fast(owner, name, until)
+        if result == "__EXHAUSTED__":
+            # Repo has no PRs in this window — don't waste API calls
+            print(f"    No PRs found in window, skipping collection", flush=True)
+            return []
+        initial_cursor = result
 
     all_changes: list[MergedChange] = []
     cursor: str | None = initial_cursor
@@ -499,8 +505,8 @@ def _skip_to_window_fast(
         page_info = prs_data.get("pageInfo", {})
 
         if not nodes:
-            print(f" exhausted all PRs ({total_skipped} skipped)", flush=True)
-            return cursor
+            print(f" exhausted all PRs ({total_skipped} skipped), no PRs in window", flush=True)
+            return "__EXHAUSTED__"
 
         # Check if any PR on this page is in or before our window
         min_merged = None
@@ -524,7 +530,7 @@ def _skip_to_window_fast(
         if not page_info.get("hasNextPage"):
             print(f" reached end of repo ({total_skipped} PRs), "
                   f"no PRs in window", flush=True)
-            return cursor
+            return "__EXHAUSTED__"
 
         cursor = page_info.get("endCursor")
         if not cursor:
