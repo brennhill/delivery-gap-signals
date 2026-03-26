@@ -251,19 +251,22 @@ def _parse_pr_node(
     pr: dict, repo: str, lookback_days: int,
     since: datetime | None = None, until: datetime | None = None,
 ) -> MergedChange | None:
-    """Convert a GraphQL PR node to MergedChange. Returns None if outside window."""
+    """Convert a GraphQL PR node to MergedChange. Returns None only if no mergedAt.
+
+    When since/until are set, we save ALL PRs (filter during analysis).
+    This avoids losing data when UPDATED_AT ordering scrambles page order.
+    The stop condition (any_before_since) in the caller handles when to
+    stop paging.
+    """
     merged_at = pr.get("mergedAt")
     if not merged_at:
         return None
 
     merged_dt = datetime.fromisoformat(merged_at.replace("Z", "+00:00"))
 
-    # Fixed window takes precedence over lookback_days
-    if since and merged_dt < since:
-        return None
-    if until and merged_dt > until:
-        return None
-    if not since:
+    # For historical fetches (since/until), save everything — filter later
+    # For lookback_days (no since), filter here
+    if not since and not until:
         cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
         if merged_dt < cutoff:
             return None
@@ -408,6 +411,13 @@ def fetch_changes(
         added_this_page = 0
         any_before_since = False
         for pr in nodes:
+            # Check if this PR is older than our window (stop signal)
+            mat = pr.get("mergedAt")
+            if mat and since:
+                dt = datetime.fromisoformat(mat.replace("Z", "+00:00"))
+                if dt < since:
+                    any_before_since = True
+
             change = _parse_pr_node(pr, repo, lookback_days, since=since, until=until)
             if change is not None:
                 all_changes.append(change)
@@ -416,13 +426,6 @@ def fetch_changes(
                     if incremental_path:
                         _save_incremental(incremental_path, all_changes[:limit])
                     return all_changes[:limit]
-            else:
-                # Track if we've gone past the window (older than since)
-                mat = pr.get("mergedAt")
-                if mat and since:
-                    dt = datetime.fromisoformat(mat.replace("Z", "+00:00"))
-                    if dt < since:
-                        any_before_since = True
 
         # Save after every page so no data is lost on interrupt
         if incremental_path and all_changes:
