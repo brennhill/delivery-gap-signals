@@ -8,12 +8,19 @@ in a single query per page.
 from __future__ import annotations
 
 import json
-import os
+import logging
 import re
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from ..models import CIStatus, Commit, MergedChange, Review
+
+_log = logging.getLogger(__name__)
+
+# Sentinel for _skip_to_window_fast indicating no PRs exist in the window.
+_EXHAUSTED = object()
 
 _REPO_PATTERN = re.compile(r"^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$")
 
@@ -120,7 +127,8 @@ def _parse_ci_status(pr_node: dict) -> CIStatus | None:
     if not commits:
         return CIStatus.NO_CHECKS
 
-    rollup = (commits[0].get("commit", {}).get("statusCheckRollup") or {})
+    # Last commit is the PR HEAD — that's where CI status lives
+    rollup = (commits[-1].get("commit", {}).get("statusCheckRollup") or {})
     contexts = rollup.get("contexts", {}).get("nodes", [])
     if not contexts:
         return CIStatus.NO_CHECKS
@@ -214,11 +222,10 @@ def _run_graphql(query: str, variables: dict, timeout: int = 60) -> dict:
         err_text = result.stderr.strip()
         # Rate limit: wait and retry
         if any(sig in err_text.lower() for sig in _RATE_LIMIT_SIGNALS):
-            import time as _time
             wait = 900  # 15 minutes
             print(f"\n  *** GitHub rate limit hit. Waiting {wait//60} minutes... ***",
                   flush=True)
-            _time.sleep(wait)
+            time.sleep(wait)
             # Retry once after waiting
             try:
                 result = subprocess.run(
@@ -308,24 +315,27 @@ def _parse_pr_node(
 
 
 def _save_incremental(path: str, changes: list[MergedChange]) -> None:
-    """Save fetched PRs to disk after each page. Merges with existing data."""
-    import json as _json
-    from pathlib import Path as _Path
+    """Save fetched PRs to disk after each page. Merges with existing data.
 
-    p = _Path(path)
-    existing = {}
+    Uses atomic write-then-rename so a crash mid-write never corrupts
+    the existing file.
+    """
+    p = Path(path)
+    existing: dict[int | None, dict] = {}
     if p.exists():
         try:
-            for pr in _json.loads(p.read_text()):
+            for pr in json.loads(p.read_text()):
                 existing[pr.get("pr_number")] = pr
-        except Exception:
-            pass
+        except (json.JSONDecodeError, TypeError) as exc:
+            _log.warning("Corrupt incremental file %s, starting fresh: %s", path, exc)
 
     for c in changes:
         d = c.to_dict()
         existing[d.get("pr_number")] = d
 
-    p.write_text(_json.dumps(list(existing.values()), indent=2, default=str))
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(list(existing.values()), indent=2, default=str))
+    tmp.rename(p)
 
 
 def fetch_changes(
@@ -344,19 +354,19 @@ def fetch_changes(
     - since/until: fixed date window (for historical fetches)
     - lookback_days: N days from now (default)
 
-    Adaptive page sizing: starts at min page size, scales up on
-    consecutive successes. Set limit > 0 to cap total results.
+    Adaptive page sizing: starts at requested page_size, halves on gateway
+    errors (floor at _MIN_PAGE_SIZE), scales back up after 3 consecutive
+    successes. Set limit > 0 to cap total results.
     """
     _validate_repo(repo)
 
     owner, name = repo.split("/", 1)
 
-    # For historical fetches, binary-search to the right window
+    # For historical fetches, skip ahead to the right window
     initial_cursor = None
-    skip_exhausted = False
     if since and until:
         result = _skip_to_window_fast(owner, name, until)
-        if result == "__EXHAUSTED__":
+        if result is _EXHAUSTED:
             # Repo has no PRs in this window — don't waste API calls
             print(f"    No PRs found in window, skipping collection", flush=True)
             return []
@@ -364,9 +374,9 @@ def fetch_changes(
 
     all_changes: list[MergedChange] = []
     cursor: str | None = initial_cursor
-    # Start small, scale up on success. Avoids wasting API calls on
-    # 504s at larger sizes. Most repos work fine at 5; some can handle 25+.
-    current_page_size = _MIN_PAGE_SIZE
+    # Start at requested size, back off on gateway errors, scale back up
+    # after consecutive successes.
+    current_page_size = max(_MIN_PAGE_SIZE, page_size)
     consecutive_successes = 0
 
     while True:
@@ -463,7 +473,7 @@ query($owner: String!, $repo: String!, $after: String, $pageSize: Int!) {
 
 def _skip_to_window_fast(
     owner: str, name: str, until: datetime,
-) -> str | None:
+) -> str | None | object:
     """Jump ahead in big leaps to find PRs near `until`.
 
     Uses a minimal query (just mergedAt + cursor) with large page sizes
@@ -506,7 +516,7 @@ def _skip_to_window_fast(
 
         if not nodes:
             print(f" exhausted all PRs ({total_skipped} skipped), no PRs in window", flush=True)
-            return "__EXHAUSTED__"
+            return _EXHAUSTED
 
         # Check if any PR on this page is in or before our window
         min_merged = None
@@ -530,7 +540,7 @@ def _skip_to_window_fast(
         if not page_info.get("hasNextPage"):
             print(f" reached end of repo ({total_skipped} PRs), "
                   f"no PRs in window", flush=True)
-            return "__EXHAUSTED__"
+            return _EXHAUSTED
 
         cursor = page_info.get("endCursor")
         if not cursor:

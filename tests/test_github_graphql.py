@@ -231,22 +231,23 @@ class TestAdaptivePageSize(unittest.TestCase):
             github_graphql.fetch_changes("owner/repo", page_size=5)
 
     @mock.patch.object(github_graphql, "_run_graphql")
-    def test_grows_back_after_success(self, mock_gql):
-        """After a successful small page, should try growing back."""
-        page1_pr = _make_pr_node(number=1)
-        page2_pr = _make_pr_node(number=2)
+    def test_grows_back_after_consecutive_successes(self, mock_gql):
+        """After 3 consecutive successes at reduced size, should scale back up."""
+        prs = [_make_pr_node(number=i) for i in range(1, 6)]
         mock_gql.side_effect = [
-            RuntimeError("502"),                                    # 100 fails
-            _graphql_response([page1_pr], has_next=True, end_cursor="c1"),  # 50 works
-            _graphql_response([page2_pr]),                          # grows back to 100
+            RuntimeError("502"),                                                # 100 fails
+            _graphql_response([prs[0]], has_next=True, end_cursor="c1"),        # 50: success 1
+            _graphql_response([prs[1]], has_next=True, end_cursor="c2"),        # 50: success 2
+            _graphql_response([prs[2]], has_next=True, end_cursor="c3"),        # 50: success 3 → scale up
+            _graphql_response([prs[3]], has_next=False),                        # 100: final page
         ]
 
         changes = github_graphql.fetch_changes("owner/repo", page_size=100)
 
-        self.assertEqual(len(changes), 2)
-        # First retry at 50, then grows back to 100
-        third_call_vars = mock_gql.call_args_list[2][0][1]
-        self.assertEqual(third_call_vars["pageSize"], 100)
+        self.assertEqual(len(changes), 4)
+        # After 3 successes at 50, should grow back to 100
+        fifth_call_vars = mock_gql.call_args_list[4][0][1]
+        self.assertEqual(fifth_call_vars["pageSize"], 100)
 
     @mock.patch.object(github_graphql, "_run_graphql")
     def test_non_gateway_error_raises_immediately(self, mock_gql):
